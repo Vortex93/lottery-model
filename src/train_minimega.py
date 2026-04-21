@@ -14,9 +14,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 CSV_PATH = Path("tmp/2026_04_20_xjpot.csv")
 ARTIFACT_PATH = Path("tmp/minimega_model.pt")
-LOOKBACK = 12
-BATCH_SIZE = 32
-EPOCHS = 200
+LOOKBACK = 10
+BATCH_SIZE = 24
+EPOCHS = 100
 LR = 1e-3
 FEATURE_COLUMNS = [
     "date_ordinal",
@@ -118,7 +118,7 @@ def restore_scaler(payload: dict[str, Any]) -> MinMaxScaler:
 
 
 class LottoModel(nn.Module):
-    def __init__(self, input_size: int, proj_size: int = 64, lstm_hidden: int = 64, output_size: int = 8):
+    def __init__(self, input_size: int, proj_size: int = 512, lstm_hidden: int = 64, output_size: int = 8):
         super().__init__()
         self.input_proj = nn.Linear(input_size, proj_size)
         self.lstm = nn.LSTM(
@@ -220,7 +220,7 @@ def train_model(
 
         train_loss /= len(train_loader.dataset)
 
-        if (epoch + 1) % 20 == 0 or epoch == 0 or epoch + 1 == epochs:
+        if (epoch + 1) % 1 == 0 or epoch == 0 or epoch + 1 == epochs:
             print(f"epoch={epoch + 1:03d} train_loss={train_loss:.6f}")
 
     model.eval()
