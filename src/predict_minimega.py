@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
+from math import log
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from train_minimega import (
     ARTIFACT_PATH,
     DEVICE,
     build_prediction_input,
-    clamp_prediction,
     create_model,
+    derive_next_draw_context,
     load_artifact,
-    restore_scaler,
+    MAIN_COLUMNS,
+    MAIN_PICKS,
 )
 
 # Keep this window in chronological order: oldest draw first, newest draw last.
@@ -34,14 +36,90 @@ PREDICTION_INPUT = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Predict the next Mini Mega draw from the constant input window.")
+    parser = argparse.ArgumentParser(
+        description="Predict the next Mini Mega draw from the constant input window."
+    )
     parser.add_argument("--artifact-path", default=str(ARTIFACT_PATH))
+    parser.add_argument("--count", type=int, default=1)
     return parser.parse_args()
+
+
+def build_main_candidates(
+    main_probs: torch.Tensor,
+    count: int,
+) -> list[tuple[tuple[int, ...], float]]:
+    ranked_indexes = torch.argsort(main_probs, descending=True)
+    pool_size = min(len(ranked_indexes), max(MAIN_PICKS + count * 2, 12))
+    number_pool = (ranked_indexes[:pool_size] + 1).tolist()
+    candidates: list[tuple[tuple[int, ...], float]] = []
+
+    for numbers in combinations(number_pool, MAIN_PICKS):
+        sorted_numbers = tuple(sorted(int(number) for number in numbers))
+        score = sum(
+            log(float(main_probs[number - 1]) + 1e-12)
+            for number in sorted_numbers
+        )
+        candidates.append((sorted_numbers, score))
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates
+
+
+def rank_candidate_draws(
+    main_logits: torch.Tensor,
+    mega_logits: torch.Tensor,
+    count: int,
+) -> list[dict[str, int]]:
+    main_probs = torch.sigmoid(main_logits).cpu()[0]
+    mega_probs = torch.sigmoid(mega_logits).cpu()[0]
+
+    main_candidates = build_main_candidates(main_probs, count)
+    mega_ranked = torch.argsort(mega_probs, descending=True)
+    combined_candidates: list[tuple[float, tuple[int, ...], int]] = []
+
+    for main_numbers, main_score in main_candidates[: max(count * 10, 40)]:
+        for mega_index in mega_ranked[: max(count * 5, 10)]:
+            mega_number = int(mega_index) + 1
+            combined_candidates.append(
+                (
+                    main_score + log(float(mega_probs[int(mega_index)]) + 1e-12),
+                    main_numbers,
+                    mega_number,
+                )
+            )
+
+    combined_candidates.sort(key=lambda item: item[0], reverse=True)
+    unique_predictions: list[dict[str, int]] = []
+    seen: set[tuple[int, ...]] = set()
+
+    for _, main_numbers, mega_number in combined_candidates:
+        draw_key = (*main_numbers, mega_number)
+        if draw_key in seen:
+            continue
+
+        seen.add(draw_key)
+        unique_predictions.append(
+            {
+                "n1": main_numbers[0],
+                "n2": main_numbers[1],
+                "n3": main_numbers[2],
+                "n4": main_numbers[3],
+                "mb": mega_number,
+            }
+        )
+
+        if len(unique_predictions) >= count:
+            break
+
+    return unique_predictions
 
 
 def main() -> None:
     args = parse_args()
     artifact_path = Path(args.artifact_path)
+
+    if args.count < 1:
+        raise ValueError("--count must be at least 1")
 
     if not artifact_path.exists():
         raise FileNotFoundError(
@@ -49,30 +127,41 @@ def main() -> None:
         )
 
     artifact = load_artifact(artifact_path)
-    scaler = restore_scaler(artifact["scaler"])
-    input_df = build_prediction_input(PREDICTION_INPUT)
-
-    expected_lookback = int(artifact["lookback"])
-    if len(input_df) != expected_lookback:
+    if int(artifact.get("artifact_version", 0)) != 2:
         raise ValueError(
-            f"PREDICTION_INPUT must contain {expected_lookback} rows, got {len(input_df)}"
+            "artifact was created by the previous model format; run train_minimega.py first"
         )
 
+    input_draws = build_prediction_input(PREDICTION_INPUT)
+    expected_lookback = int(artifact["lookback"])
+
+    if len(input_draws) != expected_lookback:
+        raise ValueError(
+            f"PREDICTION_INPUT must contain {expected_lookback} rows, got {len(input_draws)}"
+        )
+
+    input_main = torch.as_tensor(
+        input_draws[MAIN_COLUMNS].to_numpy(),
+        dtype=torch.long,
+    ).unsqueeze(0).to(DEVICE)
+    input_mega = torch.as_tensor(
+        input_draws["mb"].to_numpy(),
+        dtype=torch.long,
+    ).unsqueeze(0).to(DEVICE)
+
     model = create_model(
-        input_size=int(artifact["input_size"]),
-        output_size=int(artifact["output_size"]),
+        seq_len=expected_lookback,
+        model_config=artifact["model_config"],
     )
     model.load_state_dict(artifact["model_state_dict"])
     model.eval()
 
-    scaled_input = scaler.transform(input_df.values)
-    input_tensor = torch.tensor(np.array([scaled_input], dtype=np.float32)).to(DEVICE)
-
     with torch.no_grad():
-        pred_scaled = model(input_tensor).cpu().numpy()
+        main_logits, mega_logits = model(input_main, input_mega)
 
-    pred_row = scaler.inverse_transform(pred_scaled)[0]
-    print(clamp_prediction(pred_row))
+    output = derive_next_draw_context(input_draws)
+    output["predictions"] = rank_candidate_draws(main_logits, mega_logits, args.count)
+    print(output)
 
 
 if __name__ == "__main__":
